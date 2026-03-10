@@ -1,0 +1,37 @@
+<!DOCTYPE html>
+<html>
+
+<head>
+    <title>EpicSyncCal</title>
+    <link rel="stylesheet" href="popup.css">
+</head>
+
+<body>
+    <div class="container">
+        <h2>EpicSyncCal</h2>
+        <div id="auth-section">
+            <button id="auth-btn">Sign in with Google</button>
+            <p id="auth-status" class="status-msg">Not authenticated.</p>
+        </div>
+        <div id="settings-section" style="display: none;">
+            <div id="domain-config" class="config-box">
+                <p><strong>Configuring for:</strong> <span id="active-domain">Loading...</span></p>
+
+                <label for="event-prefix">Event Prefix:</label>
+                <input type="text" id="event-prefix" placeholder="[Epic]" value="[Epic]">
+
+                <label for="calendar-select">Target Calendar:</label>
+                <select id="calendar-select">
+                    <option value="">Loading calendars...</option>
+                </select>
+
+                <button id="save-settings-btn" class="secondary-btn">Save Profile</button>
+            </div>
+
+            <p id="settings-status" class="status-msg"></p>
+        </div>
+    </div>
+    <script src="popup.js"></script>
+</body>
+
+</html>
