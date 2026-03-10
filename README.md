@@ -51,19 +51,22 @@
 
 ### 4.2 Sync Engine Phase
 1.  **Trigger:** The syncing mechanism remains dormant until the user navigates to the "Visits" or "Upcoming Appointments" page on a recognized MyChart domain.
-2.  **Intercept:** The extension silently captures the JSON response from the internal MyChart API that populates the page.
-3.  **Parse:** Extract relevant details from the internal JSON structure:
+2.  **Explicit Session Confirmation (v0.2 Feature):** Before any sync begins, the system must ensure the user has explicitly confirmed their profile layout for the current active login session.
+    *   **Injected Confirmation UI:** If the session is unconfirmed, the extension will temporarily halt the sync and inject a prominent but non-intrusive banner/modal directly into the MyChart UI (e.g., "Ready to sync appointments for Jong to [Epic] Google Calendar? [Confirm & Sync] [Edit Settings]").
+    *   **Invalidation:** If `content.js` scrapes a new patient name that differs from the last confirmed session, the previous confirmation is instantly invalidated, forcing the user to confirm again. This prevents accidental cross-account syncing if a user logs out and logs in as someone else in the same tab.
+3.  **Intercept:** Once confirmed, the extension silently captures the JSON response from the internal MyChart API that populates the page.
+4.  **Parse:** Extract relevant details from the internal JSON structure:
     *   Start time & End time.
     *   Provider Name.
     *   Location/Address.
     *   Appointment ID (crucial for deduplication).
-4.  **Diffing & Deduplication:**
+5.  **Diffing & Deduplication:**
     *   The extension checks `chrome.storage.local` for previously synced Appointment IDs.
     *   It fetches future events from the Google Calendar (filtered by an extended property or title tag containing the Epic Appointment ID).
     *   **Create:** New appointments found in the MyChart JSON are pushed to Google Calendar.
     *   **Update:** If the time or location differs from the cached version, the existing Google Calendar event is updated.
     *   **Cancel:** If a previously synced appointment (known to be in the future) is no longer present in the MyChart JSON, the extension updates the target Google Calendar event title to prepend `[CANCELED]` and sets to "Free" time, freeing up the calendar slot.
-5.  **Confirmation:** The extension injects a small, non-intrusive Toast notification into the MyChart UI (e.g., "EpicSyncCal: Successfully synced 3 appointments to Google Calendar") to assure the user the sync worked.
+6.  **Confirmation:** The extension updates the injected banner to indicate success (e.g., "EpicSyncCal: Successfully synced 3 appointments to Google Calendar").
 
 ### 4.3 Data Retrieval Scenarios
 The extension must accurately handle various ways a user might interact with MyChart to ensure the payload is captured:
@@ -118,7 +121,13 @@ The extension must accurately handle various ways a user might interact with MyC
 2.  Updated `chrome.storage.local` to use a composite key consisting of `Hostname-PatientName` to map distinct profiles to different Google Calendars and prefixes.
 3.  Upgraded the Popup UI to be context-aware, populating the active domain and the actively scraped patient name automatically.
 
-### Phase 6: Testing & Usage
+### Phase 6: Session Confirmation (v0.2)
+1.  **Session Tracking:** Store a `confirmedSession` object in `chrome.storage.local` consisting of `{ hostname, patientName, timestamp }`.
+2.  **Invalidation Logic:** Modify `content.js` so that when a new patient name is scraped, it clears `confirmedSession` if it doesn't match the new name.
+3.  **Injected UI:** Inject a Confirmation Banner onto the MyChart page when a payload is intercepted *if* the session is unconfirmed. The sync process (`background.js`) will wait for the user to click "Confirm" on this banner before proceeding.
+4.  **Sync Gate:** Update `background.js` to verify `confirmedSession` exists and matches the payload context before executing the Google Calendar API calls.
+
+### Phase 7: Testing & Usage
 1.  Load the extension locally in Chrome via `chrome://extensions` ("Developer Mode").
 2.  Manually log into MyChart and navigate to the visits page.
 3.  Verify the Toast notification appears and events correctly populate the target Google Calendar.
