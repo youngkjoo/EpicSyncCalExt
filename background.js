@@ -6,6 +6,20 @@ chrome.runtime.onInstalled.addListener(() => {
 
 // Listen for messages from content scripts or popup
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+    if (message.type === 'VALIDATE_PROFILE') {
+        // Content script is asking for the active profile details to display in the UI banner
+        const hostname = message.hostname;
+        const patientName = message.patientName || "Unknown";
+
+        getProfileDetails(hostname, patientName).then(details => {
+            sendResponse(details);
+        }).catch(e => {
+            console.error(e);
+            sendResponse({ error: e.message });
+        });
+        return true; // async response
+    }
+
     if (message.type === 'PROCESS_EPIC_PAYLOAD') {
         const rawPayload = message.payload;
         const hostname = message.hostname;
@@ -22,10 +36,57 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     return true; // Keep message channel open for async response if needed elsewhere
 });
 
-async function processSync(hostname, patientName, payload) {
-    // 1. Check if we have a valid calendar configured for this domain+patient
-    const settings = await chrome.storage.local.get(['profiles', 'targetCalendarId']); // Target used as legacy fallback
+async function getProfileDetails(hostname, patientName) {
+    const settings = await chrome.storage.local.get(['profiles', 'targetCalendarId']);
+    let calendarId = null;
+    let prefix = "[Epic]";
 
+    const profileKey = `${hostname}-${patientName}`;
+
+    if (settings.profiles && settings.profiles[profileKey]) {
+        calendarId = settings.profiles[profileKey].calendarId;
+        prefix = settings.profiles[profileKey].prefix || "[Epic]";
+    } else if (settings.profiles && settings.profiles[hostname]) {
+        calendarId = settings.profiles[hostname].calendarId;
+        prefix = settings.profiles[hostname].prefix || "[Epic]";
+    } else if (settings.targetCalendarId) {
+        calendarId = settings.targetCalendarId;
+    }
+
+    if (!calendarId) {
+        return { prefix: prefix, calendarName: "None (Please Configure)" };
+    }
+
+    const token = await getAuthToken().catch(() => null);
+    if (!token) {
+        return { prefix: prefix, calendarName: "Google Auth Required" };
+    }
+
+    try {
+        const response = await fetch(`https://www.googleapis.com/calendar/v3/calendars/${encodeURIComponent(calendarId)}`, {
+            headers: { 'Authorization': `Bearer ${token}` }
+        });
+        if (response.ok) {
+            const data = await response.json();
+            return { prefix: prefix, calendarName: data.summary || "Unknown Calendar" };
+        }
+    } catch (e) { }
+
+    return { prefix: prefix, calendarName: calendarId };
+}
+
+async function processSync(hostname, patientName, payload) {
+    // 0. (v0.2 Sync Gate) Verify this session is explicitly confirmed before doing anything
+    const settings = await chrome.storage.local.get(['profiles', 'targetCalendarId', 'confirmedSession']); // Target used as legacy fallback
+
+    if (!settings.confirmedSession ||
+        settings.confirmedSession.hostname !== hostname ||
+        settings.confirmedSession.patientName !== patientName) {
+        console.warn(`EpicSyncCal: Sync aborted. Session for ${patientName} on ${hostname} is unconfirmed.`);
+        return;
+    }
+
+    // 1. Check if we have a valid calendar configured for this domain+patient
     let calendarId = null;
     let prefix = "[Epic]";
 

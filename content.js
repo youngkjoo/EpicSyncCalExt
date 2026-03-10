@@ -30,29 +30,128 @@ window.addEventListener('message', (event) => {
     console.log("EpicSyncCal (Isolated World): Received payload from injected script.", rawData);
 
     // Retrieve the active patient name we scraped earlier from the DOM
-    chrome.storage.local.get(['activePatients'], (result) => {
+    chrome.storage.local.get(['activePatients', 'confirmedSession'], (result) => {
         let activePatient = "Unknown";
         if (result.activePatients && result.activePatients[window.location.hostname]) {
             activePatient = result.activePatients[window.location.hostname];
         }
 
-        // Forward the payload to the background service worker for processing
-        // Attach the hostname and activePatient so the background worker can lookup the correct calendar profile
-        chrome.runtime.sendMessage({
-            type: 'PROCESS_EPIC_PAYLOAD',
-            payload: rawData,
-            hostname: window.location.hostname,
-            patientName: activePatient
-        }, (response) => {
-            if (chrome.runtime.lastError) {
-                console.error("EpicSyncCal: Extension background worker is offline or failed", chrome.runtime.lastError);
-                return;
-            }
-            console.log("EpicSyncCal: Background worker acknowledged sync request.", response);
-            showToast("EpicSyncCal: Syncing appointments to Google Calendar in background...");
-        });
+        const hostname = window.location.hostname;
+
+        const forwardPayload = () => {
+            // Forward the payload to the background service worker for processing
+            // Attach the hostname and activePatient so the background worker can lookup the correct calendar profile
+            chrome.runtime.sendMessage({
+                type: 'PROCESS_EPIC_PAYLOAD',
+                payload: rawData,
+                hostname: hostname,
+                patientName: activePatient
+            }, (response) => {
+                if (chrome.runtime.lastError) {
+                    console.error("EpicSyncCal: Extension background worker is offline or failed", chrome.runtime.lastError);
+                    return;
+                }
+                console.log("EpicSyncCal: Background worker acknowledged sync request.", response);
+                showToast("EpicSyncCal: Syncing appointments to Google Calendar in background...");
+            });
+        };
+
+        // Check if session is explicitly confirmed for this specific patient
+        if (result.confirmedSession &&
+            result.confirmedSession.hostname === hostname &&
+            result.confirmedSession.patientName === activePatient) {
+            forwardPayload();
+        } else {
+            // Fetch the profile details from the background worker so we can show them to the user
+            chrome.runtime.sendMessage({
+                type: 'VALIDATE_PROFILE',
+                hostname: hostname,
+                patientName: activePatient
+            }, (profileDetails) => {
+                if (chrome.runtime.lastError) {
+                    console.error("EpicSyncCal: Background worker error getting profile", chrome.runtime.lastError);
+                    injectConfirmationBanner(activePatient, hostname, "Unknown", "Unknown Calendar", forwardPayload);
+                } else {
+                    injectConfirmationBanner(activePatient, hostname, profileDetails.prefix, profileDetails.calendarName, forwardPayload);
+                }
+            });
+        }
     });
 });
+
+function injectConfirmationBanner(patientName, hostname, prefix, calendarName, onConfirm) {
+    if (document.getElementById('epicsynccal-confirm-banner')) return;
+
+    const banner = document.createElement('div');
+    banner.id = 'epicsynccal-confirm-banner';
+    banner.style.position = 'fixed';
+    banner.style.top = '0';
+    banner.style.left = '0';
+    banner.style.width = '100%';
+    banner.style.backgroundColor = '#fff3cd';
+    banner.style.color = '#856404';
+    banner.style.padding = '15px 20px';
+    banner.style.zIndex = '9999999';
+    banner.style.boxShadow = '0 4px 6px rgba(0,0,0,0.1)';
+    banner.style.fontFamily = 'system-ui, sans-serif';
+    banner.style.display = 'flex';
+    banner.style.justifyContent = 'space-between';
+    banner.style.alignItems = 'center';
+    banner.style.borderBottom = '2px solid #ffeeba';
+    banner.style.boxSizing = 'border-box';
+
+    const text = document.createElement('span');
+    text.innerHTML = `<strong>EpicSyncCal v0.2:</strong> Ready to sync <strong>${patientName}</strong>'s appointments to <strong>${calendarName}</strong> using prefix <strong>${prefix}</strong>. Is this correct?`;
+
+    const btnContainer = document.createElement('div');
+
+    const confirmBtn = document.createElement('button');
+    confirmBtn.innerText = 'Sync Now';
+    confirmBtn.style.backgroundColor = '#28a745';
+    confirmBtn.style.color = 'white';
+    confirmBtn.style.border = 'none';
+    confirmBtn.style.padding = '8px 16px';
+    confirmBtn.style.borderRadius = '4px';
+    confirmBtn.style.cursor = 'pointer';
+    confirmBtn.style.fontWeight = 'bold';
+    confirmBtn.style.marginLeft = '15px';
+
+    const cancelBtn = document.createElement('button');
+    cancelBtn.innerText = 'Cancel';
+    cancelBtn.style.backgroundColor = '#6c757d';
+    cancelBtn.style.color = 'white';
+    cancelBtn.style.border = 'none';
+    cancelBtn.style.padding = '8px 16px';
+    cancelBtn.style.borderRadius = '4px';
+    cancelBtn.style.cursor = 'pointer';
+    cancelBtn.style.marginLeft = '10px';
+
+    confirmBtn.onclick = () => {
+        chrome.storage.local.set({
+            confirmedSession: {
+                hostname: hostname,
+                patientName: patientName,
+                timestamp: Date.now()
+            }
+        }, () => {
+            banner.remove();
+            onConfirm();
+        });
+    };
+
+    cancelBtn.onclick = () => {
+        banner.remove();
+        console.log("EpicSyncCal: Sync canceled by user.");
+    };
+
+    btnContainer.appendChild(confirmBtn);
+    btnContainer.appendChild(cancelBtn);
+
+    banner.appendChild(text);
+    banner.appendChild(btnContainer);
+
+    document.body.appendChild(banner);
+}
 
 // --- Patient Name Harvesting ---
 // Because some hospitals (like HHC) do not include the patient name in the UpcomingVisits payload,
@@ -87,11 +186,22 @@ function harvestPatientName() {
     const name = findName();
     if (name) {
         // Save the active patient for this domain
-        chrome.storage.local.get(['activePatients'], (result) => {
+        chrome.storage.local.get(['activePatients', 'confirmedSession'], (result) => {
             let activePatients = result.activePatients || {};
             if (activePatients[window.location.hostname] !== name) {
                 activePatients[window.location.hostname] = name;
-                chrome.storage.local.set({ activePatients: activePatients }, () => {
+
+                let storageUpdates = { activePatients: activePatients };
+
+                // Invalidate confirmed session if patient name changed for this hostname
+                if (result.confirmedSession &&
+                    result.confirmedSession.hostname === window.location.hostname &&
+                    result.confirmedSession.patientName !== name) {
+                    console.log("EpicSyncCal: Patient name changed. Invalidating previous session confirmation.");
+                    storageUpdates.confirmedSession = null;
+                }
+
+                chrome.storage.local.set(storageUpdates, () => {
                     console.log(`EpicSyncCal: Harvested active patient name: ${name}`);
                 });
             }
