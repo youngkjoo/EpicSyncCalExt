@@ -1,0 +1,12 @@
+# Minimal .gitignore for Chrome Extensions
+.DS_Store
+Thumbs.db
+node_modules/
+.env
+*.pem
+*.crx
+# Editor directories and files
+.idea/
+.vscode/
+*.swp
+*.swo
