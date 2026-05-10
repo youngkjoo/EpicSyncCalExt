@@ -1,8 +1,11 @@
 // EpicSyncCal Content Script
 
 // A generic heuristic for MyChart environments:
-const hostname = window.location.hostname.toLowerCase();
-if (hostname.includes('mychart') || document.querySelector('meta[name="apple-itunes-app"][content*="mychart"]')) {
+// 1. URL check: catches standard and some white-labeled portals (like Kaiser /mychartcn/).
+// 2. Meta tag check: catches heavily white-labeled portals that strip "mychart" from the URL 
+//    but still include the iOS Smart App Banner to prompt downloading the MyChart app.
+const href = window.location.href.toLowerCase();
+if (href.includes('mychart') || document.querySelector('meta[name="apple-itunes-app"][content*="mychart"]')) {
     console.log("EpicSyncCal: Activity detected on a MyChart domain.");
     injectNetworkInterceptor();
 }
@@ -39,20 +42,33 @@ window.addEventListener('message', (event) => {
         const hostname = window.location.hostname;
 
         const forwardPayload = () => {
-            // Forward the payload to the background service worker for processing
-            // Attach the hostname and activePatient so the background worker can lookup the correct calendar profile
+            const toast = showToast("EpicSyncCal: Syncing appointments to Google Calendar...", 0); // Persistent
+
             chrome.runtime.sendMessage({
                 type: 'PROCESS_EPIC_PAYLOAD',
                 payload: rawData,
                 hostname: hostname,
                 patientName: activePatient
             }, (response) => {
-                if (chrome.runtime.lastError) {
-                    console.error("EpicSyncCal: Extension background worker is offline or failed", chrome.runtime.lastError);
+                if (chrome.runtime.lastError || !response || response.ignored) {
+                    // Silently ignore non-appointment payloads and remove the persistent toast
+                    removeToast(toast);
                     return;
                 }
-                console.log("EpicSyncCal: Background worker acknowledged sync request.", response);
-                showToast("EpicSyncCal: Syncing appointments to Google Calendar in background...");
+
+                if (response.error) {
+                    toast.textContent = `EpicSyncCal Error: ${response.error}`;
+                    toast.style.backgroundColor = "#d93025";
+                    setTimeout(() => removeToast(toast), 6000);
+                } else if (response.success) {
+                    const { created, updated, canceled } = response.details;
+                    toast.innerHTML = `<strong>EpicSyncCal:</strong> Sync complete! <br><small>Added: ${created} | Updated: ${updated} | Canceled: ${canceled}</small>`;
+                    toast.style.backgroundColor = "#188038"; // Success green
+                    setTimeout(() => removeToast(toast), 5000);
+                } else {
+                    toast.textContent = "EpicSyncCal: No new appointments found to sync.";
+                    setTimeout(() => removeToast(toast), 4000);
+                }
             });
         };
 
@@ -216,7 +232,7 @@ function harvestPatientName() {
 // Start harvesting when the content script loads
 harvestPatientName();
 
-function showToast(message) {
+function showToast(message, duration = 4000) {
     const toast = document.createElement('div');
     toast.textContent = message;
     toast.style.position = 'fixed';
@@ -233,8 +249,14 @@ function showToast(message) {
 
     document.body.appendChild(toast);
 
-    setTimeout(() => {
-        toast.style.opacity = '0';
-        setTimeout(() => toast.remove(), 300);
-    }, 4000);
+    if (duration > 0) {
+        setTimeout(() => removeToast(toast), duration);
+    }
+    return toast;
+}
+
+function removeToast(toast) {
+    if (!toast || !toast.parentNode) return;
+    toast.style.opacity = '0';
+    setTimeout(() => toast.remove(), 300);
 }

@@ -26,12 +26,16 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         const patientName = message.patientName || "Unknown";
         console.log(`Received payload from MyChart content script (${hostname} - ${patientName}):`, rawPayload);
 
-        // Let the content script know we got it immediately
-        sendResponse({ status: "Processing" });
-
-        // Kick off the async sync process
-        processSync(hostname, patientName, rawPayload).catch(e => console.error("EpicSyncCal Sync Error:", e));
-        return true;
+        // Kick off the sync process and wait for result
+        processSync(hostname, patientName, rawPayload)
+            .then(result => {
+                sendResponse(result);
+            })
+            .catch(e => {
+                console.error("EpicSyncCal Sync Error:", e);
+                sendResponse({ error: e.message });
+            });
+        return true; // Keep channel open for async response
     }
     return true; // Keep message channel open for async response if needed elsewhere
 });
@@ -83,7 +87,7 @@ async function processSync(hostname, patientName, payload) {
         settings.confirmedSession.hostname !== hostname ||
         settings.confirmedSession.patientName !== patientName) {
         console.warn(`EpicSyncCal: Sync aborted. Session for ${patientName} on ${hostname} is unconfirmed.`);
-        return;
+        return { ignored: true };
     }
 
     // 1. Check if we have a valid calendar configured for this domain+patient
@@ -106,22 +110,25 @@ async function processSync(hostname, patientName, payload) {
 
     if (!calendarId) {
         console.warn(`EpicSyncCal: No target calendar mapped for domain ${hostname}. Plase click the extension to map it.`);
-        return;
+        return { error: "No calendar mapped for this provider. Click the extension icon to set it up." };
     }
 
     // 2. Fetch the OAuth Token
     const token = await getAuthToken();
     if (!token) {
         console.error("EpicSyncCal: Failed to get Google OAuth token. Please sign in via the extension popup.");
-        return;
+        return { error: "Google sign-in required. Click the extension icon." };
     }
 
     // 3. Normalize the weird MyChart JSON array into standard Appointment objects
-    const upcomingMyChart = normalizeMyChartPayload(payload, prefix);
+    const { visits: upcomingMyChart, isRecognized } = normalizeMyChartPayload(payload, prefix);
 
     if (upcomingMyChart.length === 0) {
-        console.log("No upcoming appointments found in payload. Nothing to sync.");
-        return;
+        if (isRecognized) {
+            console.log("Recognized visits payload but it was empty.");
+            return { success: true, count: 0, details: { created: 0, updated: 0, canceled: 0 } };
+        }
+        return { ignored: true };
     }
 
     console.log(`Normalized ${upcomingMyChart.length} upcoming appointments. Syncing to Google Calendar...`);
@@ -130,38 +137,58 @@ async function processSync(hostname, patientName, payload) {
     const existingEventsMap = await getExistingEvents(token, calendarId, prefix);
 
     // 5. Diff & Sync
-    await syncToCalendar(token, calendarId, upcomingMyChart, existingEventsMap, prefix);
+    const syncResult = await syncToCalendar(token, calendarId, upcomingMyChart, existingEventsMap, prefix);
 
-    console.log("Sync complete!");
+    console.log("Sync complete!", syncResult);
+    return { success: true, count: upcomingMyChart.length, details: syncResult };
 }
 
 function normalizeMyChartPayload(payload, prefix) {
     // MyChart JSON structures can vary wildly by hospital.
     // This is a generic/heuristic approach for common Epic FHIR wrappers or internal models.
     let visits = [];
+    let isRecognized = false;
 
     // Look for common array keys
     if (Array.isArray(payload)) {
         visits = payload;
+        isRecognized = true;
     } else if (payload.UpcomingVisits && Array.isArray(payload.UpcomingVisits)) {
         visits = payload.UpcomingVisits;
+        isRecognized = true;
     } else if (payload.Visits && Array.isArray(payload.Visits)) {
         visits = payload.Visits;
+        isRecognized = true;
     } else if (payload.LaterVisitsList && Array.isArray(payload.LaterVisitsList)) {
-        // Specific format intercepted from user's MyChart
+        // Specific format intercepted from Kaiser/Epic MyChart
         visits = [...payload.LaterVisitsList];
-        if (payload.NextNDaysVisits) visits = visits.concat(payload.NextNDaysVisits);
-        if (payload.InProgressVisits) visits = visits.concat(payload.InProgressVisits);
+        if (payload.NextNDaysVisits && Array.isArray(payload.NextNDaysVisits)) visits = visits.concat(payload.NextNDaysVisits);
+        if (payload.InProgressVisits && Array.isArray(payload.InProgressVisits)) visits = visits.concat(payload.InProgressVisits);
+        isRecognized = true;
+    } else if (payload.List && Array.isArray(payload.List)) {
+        // Another common list format
+        visits = payload.List;
+        isRecognized = true;
+    } else if (payload.List && typeof payload.List === 'object') {
+        // Sometimes it's an object containing the list
+        const possibleList = Object.values(payload.List).find(val => Array.isArray(val));
+        if (possibleList) {
+            visits = possibleList;
+            isRecognized = true;
+        }
     } else if (payload.entry && Array.isArray(payload.entry)) {
         // FHIR Bundle style
-        visits = payload.entry.map(e => e.resource).filter(r => r && r.resourceType === 'Encounter' || r.resourceType === 'Appointment');
+        visits = payload.entry.map(e => e.resource).filter(r => r && (r.resourceType === 'Encounter' || r.resourceType === 'Appointment'));
+        isRecognized = true;
     }
 
-    return visits.map(visit => {
+    const normalized = visits.map(visit => {
         // Build a normalized object. We must be highly defensive here.
         const id = visit.VisitID || visit.id || visit.AppointmentID || visit.EncounterID || visit.Id || visit.Csn;
         const start = visit.PrimaryDate || visit.Date || visit.StartTime || visit.start || visit.AppointmentTime;
         const end = visit.EndDate || visit.EndTime || visit.end || null;
+
+        if (!id || !start) return null;
 
         // MyChart specific fields can be nested deeply
         let providerName = visit.PrimaryProviderName || visit.ProviderName || visit.Provider?.Name || visit.participant?.[0]?.actor?.display;
@@ -203,34 +230,18 @@ function normalizeMyChartPayload(payload, prefix) {
             }
         }
 
-        if (!id || !start) return null;
-
         // --- Timezone Handling ---
-        // MyChart sends time as '3/27/2026 12:45:00 PM' and a separate TimeZone like 'EDT'.
-        // Google Calendar requires a clear timezone offset or a standard IANA timezone.
         const tzAbbr = visit.TimeZone || visit.ClientTimeZoneMarker || "EST";
-
-        // Map common US abbreviations to IANA to build an offset-aware string.
-        // Google Calendar handles explicit IANA timezones best when passing 'dateTime'.
         const tzMap = {
-            'EST': 'America/New_York',
-            'EDT': 'America/New_York',
-            'CST': 'America/Chicago',
-            'CDT': 'America/Chicago',
-            'MST': 'America/Denver',
-            'MDT': 'America/Denver',
-            'PST': 'America/Los_Angeles',
-            'PDT': 'America/Los_Angeles',
-            'AKST': 'America/Anchorage',
-            'AKDT': 'America/Anchorage',
+            'EST': 'America/New_York', 'EDT': 'America/New_York',
+            'CST': 'America/Chicago', 'CDT': 'America/Chicago',
+            'MST': 'America/Denver', 'MDT': 'America/Denver',
+            'PST': 'America/Los_Angeles', 'PDT': 'America/Los_Angeles',
+            'AKST': 'America/Anchorage', 'AKDT': 'America/Anchorage',
             'HST': 'Pacific/Honolulu'
         };
+        const ianaTz = tzMap[tzAbbr.toUpperCase()] || 'America/New_York';
 
-        const ianaTz = tzMap[tzAbbr.toUpperCase()] || 'America/New_York'; // Fallback to Eastern
-
-        // Format the raw PrimaryDate ('3/27/2026 12:45:00 PM') into a sortable standard format
-        // Because passing simple dates to new Date() assumes LOCAL browser time, we must structure it 
-        // Convert '3/27/2026 12:45:00 PM' -> '2026-03-27T12:45:00' (Naive local time)
         const naiveDateObj = new Date(start);
         const year = naiveDateObj.getFullYear();
         const month = String(naiveDateObj.getMonth() + 1).padStart(2, '0');
@@ -238,24 +249,15 @@ function normalizeMyChartPayload(payload, prefix) {
         const hours = String(naiveDateObj.getHours()).padStart(2, '0');
         const mins = String(naiveDateObj.getMinutes()).padStart(2, '0');
         const secs = String(naiveDateObj.getSeconds()).padStart(2, '0');
-
         const naiveStartStr = `${year}-${month}-${day}T${hours}:${mins}:${secs}`;
 
         let naiveEndStr;
         if (end) {
             const naiveEndObj = new Date(end);
-            const eYear = naiveEndObj.getFullYear();
-            const eMonth = String(naiveEndObj.getMonth() + 1).padStart(2, '0');
-            const eDay = String(naiveEndObj.getDate()).padStart(2, '0');
-            const eHours = String(naiveEndObj.getHours()).padStart(2, '0');
-            const eMins = String(naiveEndObj.getMinutes()).padStart(2, '0');
-            const eSecs = String(naiveEndObj.getSeconds()).padStart(2, '0');
-            naiveEndStr = `${eYear}-${eMonth}-${eDay}T${eHours}:${eMins}:${eSecs}`;
-        } else if (visit.DurationInMinutes) {
-            const naiveEndObj = new Date(naiveDateObj.getTime() + (visit.DurationInMinutes * 60 * 1000));
             naiveEndStr = `${naiveEndObj.getFullYear()}-${String(naiveEndObj.getMonth() + 1).padStart(2, '0')}-${String(naiveEndObj.getDate()).padStart(2, '0')}T${String(naiveEndObj.getHours()).padStart(2, '0')}:${String(naiveEndObj.getMinutes()).padStart(2, '0')}:${String(naiveEndObj.getSeconds()).padStart(2, '0')}`;
         } else {
-            const naiveEndObj = new Date(naiveDateObj.getTime() + 60 * 60 * 1000);
+            const duration = visit.DurationInMinutes || 60;
+            const naiveEndObj = new Date(naiveDateObj.getTime() + (duration * 60 * 1000));
             naiveEndStr = `${naiveEndObj.getFullYear()}-${String(naiveEndObj.getMonth() + 1).padStart(2, '0')}-${String(naiveEndObj.getDate()).padStart(2, '0')}T${String(naiveEndObj.getHours()).padStart(2, '0')}:${String(naiveEndObj.getMinutes()).padStart(2, '0')}:${String(naiveEndObj.getSeconds()).padStart(2, '0')}`;
         }
 
@@ -268,6 +270,8 @@ function normalizeMyChartPayload(payload, prefix) {
             description: descriptionLines.join('\n')
         };
     }).filter(v => v !== null);
+
+    return { visits: normalized, isRecognized };
 }
 
 function getAuthToken() {
@@ -284,8 +288,6 @@ function getAuthToken() {
 
 async function getExistingEvents(token, calendarId, prefix) {
     const apiBase = `https://www.googleapis.com/calendar/v3/calendars/${encodeURIComponent(calendarId)}/events`;
-
-    // Only fetch events from today forward to avoid massive scans and touching past history
     const timeMin = new Date().toISOString();
     let url = `${apiBase}?timeMin=${encodeURIComponent(timeMin)}&singleEvents=true&maxResults=500`;
 
@@ -297,22 +299,16 @@ async function getExistingEvents(token, calendarId, prefix) {
         const response = await fetch(fetchUrl, {
             headers: { 'Authorization': `Bearer ${token}` }
         });
-
         if (!response.ok) break;
-
         const data = await response.json();
         const events = data.items || [];
-
         for (const event of events) {
-            // Find our specific appointments by checking for our custom property
-            if (event.extendedProperties && event.extendedProperties.private && event.extendedProperties.private.myChartId) {
-                // Ensure we only diff against events matching this specific prefix/profile if they share a calendar
+            if (event.extendedProperties?.private?.myChartId) {
                 if (event.summary && event.summary.startsWith(prefix)) {
                     eventsMap.set(event.extendedProperties.private.myChartId, event);
                 }
             }
         }
-
         nextPageToken = data.nextPageToken;
     } while (nextPageToken);
 
@@ -321,69 +317,59 @@ async function getExistingEvents(token, calendarId, prefix) {
 
 async function syncToCalendar(token, calendarId, upcomingMyChart, existingEventsMap, prefix) {
     const apiBase = `https://www.googleapis.com/calendar/v3/calendars/${encodeURIComponent(calendarId)}/events`;
+    let created = 0;
+    let updated = 0;
+    let canceled = 0;
 
-    // 1. Create or Update active appointments
     for (const appt of upcomingMyChart) {
         const existingEvent = existingEventsMap.get(appt.id);
-
         const eventBody = {
             summary: appt.title,
             location: appt.location,
             description: appt.description,
-            start: appt.start, // Now an object: { dateTime: "...", timeZone: "..." }
-            end: appt.end,     // Now an object: { dateTime: "...", timeZone: "..." }
-            extendedProperties: {
-                private: { myChartId: appt.id }
-            }
+            start: appt.start,
+            end: appt.end,
+            extendedProperties: { private: { myChartId: appt.id } }
         };
 
         if (existingEvent) {
-            // Check if details changed (simplified: check start time, we compare the naive date strings)
-            // Existing Google Calendar events might return as pure ISO depending on settings, so we need a robust check.
             const googleStartStr = existingEvent.start.dateTime ? existingEvent.start.dateTime.split(/[+-Z]/)[0] : '';
             const myChartStartStr = appt.start.dateTime;
-
             if (googleStartStr !== myChartStartStr || existingEvent.location !== appt.location || existingEvent.summary.includes("[CANCELED]")) {
-                console.log(`Updating event: ${appt.id}`);
-                await fetch(`${apiBase}/${existingEvent.id}`, {
+                const response = await fetch(`${apiBase}/${existingEvent.id}`, {
                     method: 'PUT',
                     headers: { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json' },
                     body: JSON.stringify(eventBody)
                 });
+                if (response.ok) updated++;
             }
-            // Remove from map to track what's no longer in MyChart
             existingEventsMap.delete(appt.id);
         } else {
-            // Create new
-            console.log(`Creating new event: ${appt.id}`);
-            await fetch(apiBase, {
+            const response = await fetch(apiBase, {
                 method: 'POST',
                 headers: { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json' },
                 body: JSON.stringify(eventBody)
             });
+            if (response.ok) created++;
         }
     }
 
-    // 2. Cancel orphan events (Events in GCal but no longer in MyChart future payload)
     for (const [orphanId, orphanEvent] of existingEventsMap.entries()) {
         if (!orphanEvent.summary.includes("[CANCELED]")) {
-            console.log(`Canceling orphan event: ${orphanId}`);
-
             const canceledBody = {
                 summary: `[CANCELED] ${orphanEvent.summary}`,
                 start: orphanEvent.start,
                 end: orphanEvent.end,
-                transparency: "transparent", // Mark as Free time
+                transparency: "transparent",
                 extendedProperties: orphanEvent.extendedProperties
             };
-
-            await fetch(`${apiBase}/${orphanEvent.id}`, {
+            const response = await fetch(`${apiBase}/${orphanEvent.id}`, {
                 method: 'PUT',
                 headers: { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json' },
                 body: JSON.stringify(canceledBody)
             });
+            if (response.ok) canceled++;
         }
     }
-
-    console.log("Sync complete!");
+    return { created, updated, canceled };
 }
